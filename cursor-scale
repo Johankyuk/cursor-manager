@@ -1,0 +1,655 @@
+#!/usr/bin/env python3
+"""
+cursor-scale — wizard mínimo para cambiar el tamaño del cursor en niri.
+
+No toca el tema: respeta el que esté puesto, sea el que sea.
+Pregunta un número, lo aplica en las capas que importan y verifica.
+
+Capas que escribe:
+  1. bloque `cursor { ... }` de niri (el .kdl real, donde sea que viva)
+  2. gsettings org.gnome.desktop.interface cursor-size   (GTK vía portal)
+  3. ~/.config/gtk-3.0/settings.ini y gtk-4.0 (si existen)
+
+niri recarga su config sola al guardarla, así que el cursor del
+compositor cambia en el acto. Las apps ya abiertas heredaron
+XCURSOR_SIZE al arrancar y no se enteran hasta que se relanzan.
+
+Catálogo: escanea los directorios estándar de temas de cursor y lista
+los instalados, con los tamaños nominales que trae cada uno.
+
+    ~/.local/share/icons     ← destino canónico de las instalaciones
+    ~/.icons                 ← legacy, se lee pero no se escribe
+    /usr/local/share/icons
+    /usr/share/icons         ← paquetes de pacman
+    $XCURSOR_PATH            ← si está definido, se antepone
+
+Uso:
+    cursor-scale                    # interactivo
+    cursor-scale 32                 # solo tamaño, sin preguntar
+    cursor-scale --list             # catálogo de temas instalados
+    cursor-scale --theme NOMBRE 32  # tema + tamaño
+    cursor-scale --install ARCHIVO  # instala un tema desde un comprimido
+"""
+
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+NIRI_DIR = HOME / ".config" / "niri"
+MIN_SIZE, MAX_SIZE = 8, 256
+FALLBACK_THEME = "Adwaita"
+
+# Destino de las instalaciones. Los demás se leen para el catálogo.
+USER_ICONS = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "icons"
+THEME_DIRS = [
+    USER_ICONS,
+    HOME / ".icons",
+    Path("/usr/local/share/icons"),
+    Path("/usr/share/icons"),
+]
+if os.environ.get("XCURSOR_PATH"):
+    THEME_DIRS = [Path(d) for d in os.environ["XCURSOR_PATH"].split(":") if d] + THEME_DIRS
+
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RESET = "\033[0m"
+
+
+def die(msg, hold=True):
+    print(f"{RED}✗ {msg}{RESET}")
+    if hold and sys.stdin.isatty():
+        input(f"\n{DIM}Enter para cerrar…{RESET}")
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------- niri kdl
+
+def find_cursor_block():
+    """Devuelve (path, start_idx, end_idx, lines) del bloque `cursor {`.
+
+    Busca en todos los .kdl bajo ~/.config/niri, así que da igual si el
+    bloque vive en config.kdl o en un cfg/*.kdl incluido.
+    """
+    if not NIRI_DIR.is_dir():
+        return None
+
+    # Descartar backups y copias inertes: un rglob crudo ordena
+    # cfg.bak.NNN/ antes que cfg/ ('.' < '/' en ASCII) y termina
+    # editando un archivo que no lee nadie.
+    STALE = (".bak", ".old", ".orig", ".save", ".disabled", ".backup")
+
+    def is_stale(path):
+        rel = path.relative_to(NIRI_DIR)
+        for part in rel.parts:
+            low = part.lower()
+            if any(marker in low for marker in STALE):
+                return True
+            if low.endswith("~"):
+                return True
+        return False
+
+    # os.walk con followlinks: Path.rglob NO desciende por symlinks de
+    # directorio, y ~/.config/niri/cfg suele serlo (apunta al repo).
+    # Con rglob, el config real es invisible y solo se ven los backups,
+    # que sí son directorios de verdad.
+    def walk_kdl():
+        seen = set()
+        for root, dirs, files in os.walk(NIRI_DIR, followlinks=True):
+            root_p = Path(root)
+            real = os.path.realpath(root)
+            if real in seen:          # corta ciclos de symlinks
+                dirs[:] = []
+                continue
+            seen.add(real)
+            if len(root_p.relative_to(NIRI_DIR).parts) >= 3:
+                dirs[:] = []
+            dirs[:] = [d for d in dirs if not is_stale(root_p / d)]
+            for f in files:
+                if f.endswith(".kdl") and not is_stale(root_p / f):
+                    yield root_p / f
+
+    candidates = sorted(walk_kdl())
+    open_re = re.compile(r"^\s*cursor\s*\{")
+
+    hits = []
+    for path in candidates:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        for i, line in enumerate(lines):
+            # Ignorar líneas comentadas
+            if line.lstrip().startswith("//") or line.lstrip().startswith("/-"):
+                continue
+            if not open_re.match(line):
+                continue
+
+            depth = 0
+            for j in range(i, len(lines)):
+                depth += lines[j].count("{") - lines[j].count("}")
+                if depth <= 0:
+                    hits.append((path, i, j, lines))
+                    break
+            break
+
+    if not hits:
+        return None
+    if len(hits) == 1:
+        return hits[0]
+    return choose(hits)
+
+
+def choose(hits):
+    """Más de un bloque `cursor {`: no adivinar, preguntar."""
+    print(f"\n{YELLOW}Encontré {len(hits)} bloques `cursor` distintos:{RESET}")
+    for n, (path, _, _, _) in enumerate(hits, 1):
+        print(f"  {n}. {str(path).replace(str(HOME), '~')}")
+    if not sys.stdin.isatty():
+        die("varios candidatos y sin terminal para elegir", hold=False)
+    try:
+        raw = input(f"\n  ¿Cuál? {DIM}(1-{len(hits)}, Enter cancela){RESET}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raw = ""
+    if not raw:
+        print("\ncancelado.")
+        sys.exit(0)
+    if not raw.isdigit() or not (1 <= int(raw) <= len(hits)):
+        die("opción inválida", hold=False)
+    return hits[int(raw) - 1]
+
+
+def read_current(lines, start, end):
+    size = theme = None
+    for line in lines[start:end + 1]:
+        m = re.match(r"\s*xcursor-size\s+\"?(\d+)\"?", line)
+        if m:
+            size = int(m.group(1))
+        m = re.match(r"\s*xcursor-theme\s+\"([^\"]*)\"", line)
+        if m:
+            theme = m.group(1)
+    return size, theme
+
+
+def write_niri(path, lines, start, end, size, theme=None):
+    body_indent = None
+    for line in lines[start + 1:end]:
+        if line.strip():
+            body_indent = line[:len(line) - len(line.lstrip())]
+            break
+    if body_indent is None:
+        base = lines[start][:len(lines[start]) - len(lines[start].lstrip())]
+        body_indent = base + "    "
+
+    def set_key(key, value_literal):
+        nonlocal lines, end
+        pat = re.compile(rf"^(\s*){re.escape(key)}\s+.*$")
+        for i in range(start + 1, end):
+            if pat.match(lines[i]) and not lines[i].lstrip().startswith("//"):
+                indent = pat.match(lines[i]).group(1)
+                nl = "\n" if lines[i].endswith("\n") else ""
+                lines[i] = f"{indent}{key} {value_literal}{nl}"
+                return
+        lines.insert(start + 1, f"{body_indent}{key} {value_literal}\n")
+        end += 1
+
+    set_key("xcursor-size", str(size))
+    if theme:
+        set_key("xcursor-theme", f'"{theme}"')
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = path.with_suffix(path.suffix + f".bak.{stamp}")
+    backup.write_bytes(path.read_bytes())
+    path.write_text("".join(lines), encoding="utf-8")
+
+    # Verificación explícita: releer del disco, no confiar en el buffer
+    got = find_cursor_block()
+    if not got:
+        die(f"tras escribir, el bloque cursor ya no se encuentra. Backup: {backup}")
+    _, s2, e2, l2 = got
+    new_size, new_theme = read_current(l2, s2, e2)
+    if new_size != size:
+        die(f"la escritura no cuajó (leído: {new_size}). Backup: {backup}")
+    if theme and new_theme != theme:
+        die(f"el tema no cuajó (leído: {new_theme}). Backup: {backup}")
+    return backup
+
+
+# ------------------------------------------------------------ otras capas
+
+def apply_gsettings(size, theme=None):
+    done = []
+    def gset(key, value):
+        try:
+            subprocess.run(
+                ["gsettings", "set", "org.gnome.desktop.interface", key, value],
+                check=True, capture_output=True,
+            )
+            done.append(key)
+        except (OSError, subprocess.CalledProcessError):
+            pass
+    gset("cursor-size", str(size))
+    if theme:
+        gset("cursor-theme", theme)
+    return done
+
+
+def apply_gtk_ini(size, theme=None):
+    touched = []
+    for ver in ("gtk-3.0", "gtk-4.0"):
+        ini = HOME / ".config" / ver / "settings.ini"
+        if not ini.is_file():
+            continue
+        text = ini.read_text(encoding="utf-8")
+        original = text
+
+        def upsert(txt, key, value):
+            pat = re.compile(rf"^{re.escape(key)}\s*=.*$", re.MULTILINE)
+            if pat.search(txt):
+                return pat.sub(f"{key}={value}", txt)
+            if "[Settings]" in txt:
+                return txt.replace("[Settings]", f"[Settings]\n{key}={value}", 1)
+            return txt.rstrip("\n") + f"\n[Settings]\n{key}={value}\n"
+
+        text = upsert(text, "gtk-cursor-theme-size", str(size))
+        if theme:
+            text = upsert(text, "gtk-cursor-theme-name", theme)
+
+        if text != original:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            ini.with_suffix(f".ini.bak.{stamp}").write_text(original, encoding="utf-8")
+            ini.write_text(text, encoding="utf-8")
+            touched.append(str(ini).replace(str(HOME), "~"))
+    return touched
+
+
+# ------------------------------------------------------------------- main
+
+# ---------------------------------------------------------------- catálogo
+
+def xcursor_sizes(path):
+    """Tamaños nominales dentro de un archivo Xcursor, leyendo la cabecera."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+            if len(head) < 16 or head[:4] != b"Xcur":
+                return []
+            hsize, _ver, ntoc = struct.unpack("<III", head[4:16])
+            f.seek(hsize)
+            out = set()
+            for _ in range(ntoc):
+                chunk = f.read(12)
+                if len(chunk) < 12:
+                    break
+                ctype, subtype, _pos = struct.unpack("<III", chunk)
+                if ctype == 0xFFFD0002:      # tipo imagen
+                    out.add(subtype)
+            return sorted(out)
+    except OSError:
+        return []
+
+
+def scan_themes():
+    """Un directorio es tema de cursor si tiene cursors/ con algo dentro.
+
+    El primero que aparezca gana: los de usuario pisan a los de sistema,
+    igual que hace Xcursor al resolver.
+    """
+    found = {}
+    for base in THEME_DIRS:
+        if not base.is_dir():
+            continue
+        try:
+            entries = sorted(base.iterdir())
+        except OSError:
+            continue
+        for d in entries:
+            cursors = d / "cursors"
+            if not cursors.is_dir() or d.name in found:
+                continue
+            try:
+                files = list(cursors.iterdir())
+            except OSError:
+                continue
+            if not files:
+                continue
+
+            probe = None
+            for name in ("left_ptr", "default", "arrow"):
+                cand = cursors / name
+                if cand.exists():
+                    probe = cand
+                    break
+            broken = sum(1 for f in files if f.is_symlink() and not f.exists())
+
+            found[d.name] = {
+                "name": d.name,
+                "path": d,
+                "system": not str(d).startswith(str(HOME)),
+                "sizes": xcursor_sizes(probe) if probe else [],
+                "count": len(files),
+                "broken": broken,
+            }
+    return sorted(found.values(), key=lambda t: (t["system"], t["name"].lower()))
+
+
+def print_catalog(themes, current=None):
+    if not themes:
+        print(f"{RED}✗ no encontré ningún tema de cursor instalado{RESET}")
+        return
+    print(f"\n{BOLD}Temas instalados{RESET}")
+    for n, t in enumerate(themes, 1):
+        mark = "●" if t["name"] == current else " "
+        origin = "sistema" if t["system"] else "usuario"
+        sizes = "/".join(str(s) for s in t["sizes"]) if t["sizes"] else "escalable?"
+        warn = f"  {RED}{t['broken']} rotos{RESET}" if t["broken"] else ""
+        print(f"  {mark} {n:2d}. {t['name'][:34]:34s} {DIM}{origin:8s}{RESET} "
+              f"{sizes:16s} {DIM}{t['count']:3d} formas{RESET}{warn}")
+    print(f"\n{DIM}  ● = en uso · los tamaños son los nominales del archivo "
+          f"Xcursor{RESET}")
+
+
+# ------------------------------------------------------------- instalador
+
+def install_archive(archive):
+    """Extrae un tema a ~/.local/share/icons y corrige defectos típicos."""
+    archive = Path(archive).expanduser()
+    if not archive.is_file():
+        die(f"no encuentro el archivo: {archive}")
+
+    USER_ICONS.mkdir(parents=True, exist_ok=True)
+    tmp = USER_ICONS / f".tmp-cursor-install-{os.getpid()}"
+    if tmp.exists():
+        shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir()
+
+    name = archive.name.lower()
+    if name.endswith(".zip"):
+        cmd = ["unzip", "-q", str(archive), "-d", str(tmp)]
+    elif name.endswith(".7z"):
+        cmd = ["7z", "x", "-y", str(archive), f"-o{tmp}"]
+    else:
+        # tar detecta gzip/bzip2/xz solo; muchos paquetes de gnome-look
+        # vienen como .tar pero por dentro son bzip2.
+        cmd = ["tar", "xf", str(archive), "-C", str(tmp)]
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except FileNotFoundError:
+        shutil.rmtree(tmp, ignore_errors=True)
+        die(f"falta la herramienta para descomprimir: {cmd[0]}")
+    except subprocess.CalledProcessError as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        die(f"falló la extracción: {e.stderr.decode(errors='replace')[:200]}")
+
+    # Buscar los directorios que sean tema (pueden venir varios, o anidados)
+    roots = [d.parent for d in tmp.rglob("cursors") if d.is_dir()]
+    roots = [r for r in roots if r != tmp]
+    if not roots:
+        shutil.rmtree(tmp, ignore_errors=True)
+        die("el comprimido no contiene ningún directorio `<tema>/cursors/`")
+
+    installed = []
+    for root in roots:
+        dest = USER_ICONS / root.name
+        if dest.exists():
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup = dest.with_name(f"{dest.name}.bak.{stamp}")
+            shutil.move(str(dest), str(backup))
+            print(f"{DIM}  instalación previa → {backup.name}{RESET}")
+        shutil.move(str(root), str(dest))
+        installed.append(dest)
+        fix_theme(dest)
+
+    shutil.rmtree(tmp, ignore_errors=True)
+    return [d.name for d in installed]
+
+
+def fix_theme(dest):
+    """Defectos habituales de los temas empaquetados a mano."""
+    cursors = dest / "cursors"
+
+    # 1. Symlinks con ruta absoluta al home del empaquetador: rotos en
+    #    cualquier otra máquina. Se reescriben como relativos.
+    fixed = broken = 0
+    for link in cursors.iterdir():
+        if not link.is_symlink():
+            continue
+        target = os.readlink(link)
+        if not os.path.isabs(target):
+            continue
+        base = os.path.basename(target)
+        if (cursors / base).exists():
+            link.unlink()
+            link.symlink_to(base)
+            fixed += 1
+        else:
+            broken += 1
+    if fixed:
+        print(f"{GREEN}✓{RESET} {dest.name}: {fixed} symlinks absolutos → relativos")
+    if broken:
+        print(f"{RED}✗{RESET} {dest.name}: {broken} symlinks sin destino válido")
+
+    # 2. cursor.theme suele traer Inherits apuntando al nombre visible del
+    #    tema (con emojis y espacios), que no resuelve a ningún directorio.
+    ct = dest / "cursor.theme"
+    if ct.is_file():
+        try:
+            body = ct.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            body = ""
+        for line in body.splitlines():
+            if line.startswith("Inherits="):
+                val = line.split("=", 1)[1].strip()
+                if not (dest.parent / val).is_dir():
+                    ct.unlink()
+                    print(f"{DIM}  {dest.name}: cursor.theme descartado "
+                          f"(Inherits inválido){RESET}")
+                break
+
+    # 3. Sin Inherits, cualquier forma que falte no cae en ningún lado.
+    idx = dest / "index.theme"
+    if idx.is_file():
+        body = idx.read_text(encoding="utf-8", errors="replace")
+        if "Inherits=" not in body:
+            with open(idx, "a", encoding="utf-8") as f:
+                f.write(f"\nInherits={FALLBACK_THEME}\n")
+            print(f"{GREEN}✓{RESET} {dest.name}: hereda de {FALLBACK_THEME}")
+    else:
+        idx.write_text(
+            f"[Icon Theme]\nName={dest.name}\nInherits={FALLBACK_THEME}\n",
+            encoding="utf-8")
+        print(f"{GREEN}✓{RESET} {dest.name}: index.theme creado")
+
+
+def pick_theme(themes, current):
+    print_catalog(themes, current)
+    try:
+        raw = input(f"\n  ¿Cuál? {DIM}(1-{len(themes)}, Enter cancela){RESET}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raw = ""
+    if not raw:
+        return None
+    if not raw.isdigit() or not (1 <= int(raw) <= len(themes)):
+        die("opción inválida")
+    return themes[int(raw) - 1]["name"]
+
+
+def parse_args(argv):
+    size = None
+    theme = None
+    action = None
+    archive = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-t", "--theme"):
+            i += 1
+            if i >= len(argv):
+                die("--theme necesita un nombre", hold=False)
+            theme = argv[i]
+        elif a in ("-l", "--list"):
+            action = "list"
+        elif a in ("-i", "--install"):
+            i += 1
+            if i >= len(argv):
+                die("--install necesita la ruta de un comprimido", hold=False)
+            action = "install"
+            archive = argv[i]
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        elif a.isdigit():
+            size = int(a)
+        else:
+            die(f"argumento no reconocido: {a}", hold=False)
+        i += 1
+    return size, theme, action, archive
+
+
+def hold():
+    if sys.stdin.isatty():
+        input(f"\n{DIM}Enter para cerrar…{RESET}")
+
+
+def main():
+    size_arg, theme_arg, action, archive = parse_args(sys.argv[1:])
+
+    if action == "list":
+        found = find_cursor_block()
+        current = None
+        if found:
+            current = read_current(found[3], found[1], found[2])[1]
+        print_catalog(scan_themes(), current)
+        hold()
+        return
+
+    if action == "install":
+        names = install_archive(archive)
+        print(f"\n{GREEN}✓{RESET} instalado en {str(USER_ICONS).replace(str(HOME), '~')}: "
+              f"{', '.join(names)}")
+        if theme_arg is None and len(names) == 1 and sys.stdin.isatty():
+            resp = input(f"\n  ¿Aplicarlo ahora? {DIM}(s/N){RESET}: ").strip().lower()
+            if resp in ("s", "si", "sí", "y"):
+                theme_arg = names[0]
+            else:
+                hold()
+                return
+        elif theme_arg is None:
+            print(f"{DIM}  aplicar con: cursor-scale --theme \"{names[0]}\" 48{RESET}")
+            hold()
+            return
+
+    found = find_cursor_block()
+    if not found:
+        die("no encontré un bloque `cursor { … }` en ningún .kdl de "
+            "~/.config/niri.\n  Agregalo primero (aunque sea vacío) y volvé a correr esto.")
+
+    path, start, end, lines = found
+    cur_size, cur_theme = read_current(lines, start, end)
+    shown = str(path).replace(str(HOME), "~")
+
+    print(f"\n{BOLD}Escala del cursor{RESET}")
+    print(f"{DIM}{shown}{RESET}\n")
+    print(f"  Tema actual    {BOLD}{cur_theme or '(sin definir — hereda el default)'}{RESET}")
+    print(f"  Tamaño actual  {BOLD}{cur_size if cur_size is not None else '(sin definir)'}{RESET}")
+
+    size = size_arg
+    if size is None and theme_arg is None:
+        if not sys.stdin.isatty():
+            die("sin terminal interactiva y sin número en los argumentos")
+        print(f"\n{DIM}  [n] tamaño   [t] tema   [i] instalar desde archivo   "
+              f"[Enter] salir{RESET}")
+        try:
+            raw = input("\n  > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raw = ""
+
+        if not raw:
+            print("\ncancelado.")
+            return
+
+        if raw.lower() == "n":
+            try:
+                num = input(f"  Tamaño {DIM}(24 32 48 64 · Enter cancela){RESET}: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                num = ""
+            if not num:
+                print("\ncancelado.")
+                return
+            if not num.isdigit():
+                die(f"'{num}' no es un número")
+            size = int(num)
+        elif raw.lower() == "t":
+            themes = scan_themes()
+            if not themes:
+                die("no hay temas instalados que ofrecer")
+            theme_arg = pick_theme(themes, cur_theme)
+            if theme_arg is None:
+                print("\ncancelado.")
+                return
+            size = cur_size
+        elif raw.lower() == "i":
+            try:
+                ruta = input(f"  Ruta del comprimido {DIM}(Enter cancela){RESET}: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                ruta = ""
+            if not ruta:
+                print("\ncancelado.")
+                return
+            names = install_archive(ruta)
+            theme_arg = names[0] if len(names) == 1 else pick_theme(
+                [t for t in scan_themes() if t["name"] in names], cur_theme)
+            if theme_arg is None:
+                return
+            size = cur_size
+        elif raw.isdigit():          # atajo: escribir el número directo
+            size = int(raw)
+        else:
+            die(f"'{raw}' no es una opción válida (n, t, i o un número)")
+
+    if size is None:
+        size = cur_size
+    if size is None:
+        die("no hay tamaño previo; indicá uno")
+    if not (MIN_SIZE <= size <= MAX_SIZE):
+        die(f"fuera de rango ({MIN_SIZE}–{MAX_SIZE})")
+
+    if theme_arg:
+        names = {t["name"] for t in scan_themes()}
+        if theme_arg not in names:
+            print(f"\n{YELLOW}⚠ '{theme_arg}' no está entre los temas instalados. "
+                  f"Se aplica igual, pero el cursor puede no cambiar.{RESET}")
+
+    if size == cur_size and (theme_arg is None or theme_arg == cur_theme):
+        print(f"\n{YELLOW}Sin cambios.{RESET}")
+        hold()
+        return
+
+    backup = write_niri(path, lines, start, end, size, theme_arg)
+    gs = apply_gsettings(size, theme_arg)
+    inis = apply_gtk_ini(size, theme_arg)
+
+    print(f"\n{GREEN}✓{RESET} niri      {shown} → xcursor-size {BOLD}{size}{RESET}"
+          + (f", xcursor-theme \"{theme_arg}\"" if theme_arg else ""))
+    if gs:
+        print(f"{GREEN}✓{RESET} gsettings {', '.join(gs)}")
+    for f in inis:
+        print(f"{GREEN}✓{RESET} gtk       {f}")
+    print(f"{DIM}  backup: {str(backup).replace(str(HOME), '~')}{RESET}")
+    print(f"\n{DIM}niri recarga solo. Las apps ya abiertas mantienen el tamaño "
+          f"viejo hasta relanzarlas.{RESET}")
+    hold()
+
+
+if __name__ == "__main__":
+    main()
