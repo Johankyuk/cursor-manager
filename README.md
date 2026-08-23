@@ -35,11 +35,22 @@ de cursor instalados y el `environment.d`, que suele usarlo otra cosa).
 | `applications/cursor-scale.desktop` | `~/.local/share/applications/` |
 | `environment.d/10-path.conf` | `~/.config/environment.d/` |
 
-El tercero es el que suele faltar: **la sesión gráfica hereda el `PATH` de
-`systemd --user`, no el de tu shell**, y en Arch ese `PATH` no incluye
-`~/.local/bin`. Sin ese archivo, el launcher abre la terminal y la cierra en el
-acto porque no encuentra el comando. Aplica desde el próximo login; `install.sh`
-además actualiza la sesión actual con `systemctl --user set-environment`.
+El tercero es para el resto de tus binarios, no para este wizard: **la sesión
+gráfica no hereda el `PATH` de tu shell**, y en Arch `~/.local/bin` no está en
+el `PATH` del sistema. Aplica desde el próximo login.
+
+El `.desktop` de este repo **no depende de eso**: invoca el wizard por ruta
+`$HOME`. Es a propósito. Si el compositor lo arranca el greeter por PAM
+(greetd con `--session niri`, por ejemplo) en vez de activarlo el manager de
+usuario, no hereda el entorno del manager y `environment.d` no llega a lo que
+lance el launcher. Confirmalo con:
+
+```bash
+tr '\0' '\n' < /proc/$(pgrep -x niri)/environ | grep '^PATH='
+```
+
+Regla general para `.desktop` propios: ruta vía `$HOME`, nunca confiar en el
+`PATH`.
 
 ### Requisito: un bloque `cursor` en niri
 

@@ -4,11 +4,12 @@ Version=1.0
 Name=Escala del cursor
 GenericName=Cursor manager
 Comment=Cambiar tamaño y tema del cursor, e instalar temas nuevos
-# Depende de que ~/.local/bin esté en el PATH de la sesión gráfica.
-# install.sh lo garantiza vía ~/.config/environment.d/10-path.conf.
-# Alternativa que no depende del PATH, si tu launcher no lo resuelve:
-#   Exec=foot --app-id=cursor-scale sh -c "exec \\$HOME/.local/bin/cursor-scale"
-Exec=foot --app-id=cursor-scale --title=cursor-scale --window-size-pixels=680x360 cursor-scale
+# Ruta vía $HOME en vez de confiar en el PATH: el compositor puede arrancar
+# desde el greeter por PAM y no heredar el entorno del manager de usuario,
+# con lo cual ~/.local/bin no está en el PATH de lo que lance el launcher.
+# El doble backslash es el escapado del formato .desktop: el archivo
+# desescapa \\ a \, y el parser de Exec entrega `exec $HOME/...` a sh -c.
+Exec=foot --app-id=cursor-scale --title=cursor-scale --window-size-pixels=680x360 sh -c "exec \\$HOME/.local/bin/cursor-scale"
 Icon=input-mouse
 Terminal=false
 Categories=Settings;DesktopSettings;
